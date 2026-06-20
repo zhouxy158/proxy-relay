@@ -42,7 +42,7 @@
 4. 确认该 hostname 的 DNS 是 **橙云代理（Proxied）** 状态。
 
 ### 2. GitHub：新建一个空仓库（在可丢弃的账号上）
-把本目录下的内容（含 `.github/workflows/proxy-relay.yml`、`.github/workflows/watchdog.yml`、`discover.py`）复制到该仓库**根目录**并推送。
+把本目录下的内容（含 `.github/workflows/proxy-relay.yml`、`discover.py`）复制到该仓库**根目录**并推送。
 **仓库设为 Public** —— 否则私有仓库每月只有 2000 分钟免费额度，24×7 约 1.4 天就用光；
 公开仓库 Actions 分钟「无限」（这也正是该用法被滥用、会被风控盯上的原因）。
 
@@ -81,18 +81,6 @@ xray + cloudflared 起来约 25 秒后，**每小时**跑一次 `python3 discove
 
 > 未设置 `GATEWAY_URL` 时三件事全跳过，代理本身照常可用。在面板里启用一个用户后，约 1 小时内（或下次任务）该节点即接受其 uuid 连接。
 
-### 7. 看门狗（`watchdog.yml`）兜底断链
-`proxy-relay` 靠自触发接力续命，但若**接力触发失败**、或 **cloudflared 在接力前意外挂掉**导致本段提前退出，链路就断了没人拉。`watchdog.yml` 兜这个底：
-
-- `schedule` **每 15 分钟**跑一次，查 `proxy-relay` 最近一次 run 的状态
-- **存活判定**：`queued`/`in_progress`，或最近 20min 内刚创建（覆盖接力 dispatch 的排队延迟）→ 啥也不做
-- 否则视为断链 → `dispatch` 一条新 `proxy-relay`（也能在首次部署时自动拉起第一条链）
-- **`concurrency` 防重复**：看门狗自身串行（`group: proxy-watchdog`），避免相邻两次 tick 同时判断+拉起
-- 触发同样**必须用 `GH_PAT`**（`GITHUB_TOKEN` 触发的 `workflow_dispatch` 不产生新 run）
-
-> ⚠️ **为什么 `proxy-relay` 自己不加 `concurrency`**：重叠接力需要「旧段 + 新段」短时间同时在线，而 1-at-a-time 的 concurrency group 会把继任者排队、毁掉重叠。所以去重只能放在看门狗的「存活检查」里，而不是给 relay 套并发组。
-> 若你**不在乎零空窗、只要绝不重复**，也可以反过来：给 `proxy-relay` 加 `concurrency: {group: proxy-relay, cancel-in-progress: false}`，这样永远只有一条链，但每次交接会有 ~1-2min 排队空窗（失去重叠）。
-
 ---
 
 ## 停止 / 清理
@@ -109,6 +97,6 @@ xray + cloudflared 起来约 25 秒后，**每小时**跑一次 `python3 discove
 > `XRAY_PORT`（默认 `8080`）仍在 `env` 里，需与 CF 隧道 Service 端口一致。
 
 ## 已知局限（也是学习点）
-- 每段换 VM/IP，虽有重叠但偶发触发失败会断链——已由 `watchdog.yml` 兜底（最多 ~15min 恢复延迟）。
+- 每段换 VM/IP，虽有重叠但偶发触发失败会断链，且无自动恢复——需手动 Run 一次重启。
 - 公开仓库才有「无限」分钟，但日志/仓库公开 = 滥用更易被发现。
 - 这套方案的稳定性、隐蔽性都远不如一台正经常驻机（Oracle 永久免费 ARM / Fly.io / VPS）。

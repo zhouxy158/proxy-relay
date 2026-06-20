@@ -7,11 +7,11 @@ name: proxy-relay
 # 仅用于一次性学习实验，请在可丢弃的账号 + 公开仓库上运行。
 
 on:
-  workflow_dispatch:        # 手动启动 + 接力自触发 + 看门狗拉起，都走这个
+  workflow_dispatch:        # 手动启动 + 接力自触发，都走这个
 
 # 注意：本工作流刻意【不加】会阻塞的 concurrency group ——
 # 重叠接力需要「旧段 + 新段」短时间同时在线，1-at-a-time 的 group 会把继任者排队、毁掉重叠。
-# 链路去重交给 watchdog.yml（存活检查 + 自身 concurrency），见 README。
+# 代价：若某次接力触发失败或本段提前退出，链路会断且无自动恢复，需手动 Run 一次重启。
 
 permissions:
   contents: read
