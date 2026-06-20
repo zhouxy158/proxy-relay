@@ -1,0 +1,146 @@
+name: proxy-relay
+
+# 学习用途：演示「重叠接力」绕过 GitHub Actions 单 job 6h 上限的机制。
+# 载荷为 Xray (VLESS-WS) + cloudflared 命名隧道。
+#
+# 注意：用 Actions 当常驻代理违反 GitHub ToS，可能导致账号封禁。
+# 仅用于一次性学习实验，请在可丢弃的账号 + 公开仓库上运行。
+
+on:
+  workflow_dispatch:        # 手动启动 + 接力自触发 + 看门狗拉起，都走这个
+
+# 注意：本工作流刻意【不加】会阻塞的 concurrency group ——
+# 重叠接力需要「旧段 + 新段」短时间同时在线，1-at-a-time 的 group 会把继任者排队、毁掉重叠。
+# 链路去重交给 watchdog.yml（存活检查 + 自身 concurrency），见 README。
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360            # GitHub 硬上限：job 在 6h 处被强杀
+    env:
+      XRAY_PORT: '8080'
+      CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}    # 同时作为 VLESS uuid 的派生种子
+      GH_PAT: ${{ secrets.GH_PAT }}
+      WORKFLOW_FILE: proxy-relay.yml
+      # ---- 节点接入网关（discover.py）----
+      GATEWAY_URL: ${{ secrets.GATEWAY_URL }}          # 网关基址（含私有路径前缀，放 Secrets，避免公开仓库泄露）
+      CF_HOSTNAME: ${{ secrets.CF_HOSTNAME }}          # Cloudflare 隧道公网域名（客户端连接地址）
+      PROXY_NAME: 'Github Actions'                     # 节点名称（国旗自动前缀）
+      ORDER: '200'                                     # 排序权重
+      # 接力 / 同步间隔均写死在脚本里（见 Run 步骤），不再用变量
+
+    steps:
+      - name: Checkout (取 discover.py)
+        uses: actions/checkout@v4
+
+      - name: Download Xray
+        run: |
+          set -euo pipefail
+          curl -fsSL -o xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o xray.zip xray -d .
+          chmod +x xray
+          ./xray version || true
+
+      - name: Download cloudflared
+        run: |
+          set -euo pipefail
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared --version || true
+
+      - name: Write Xray config (VLESS-WS, 含已启用用户)
+        run: |
+          set -euo pipefail
+          if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+            echo "::error::secret CF_TUNNEL_TOKEN 未设置"; exit 1
+          fi
+          # 由 discover.py 生成完整 xray.json：派生 uuid（节点自身）+ 网关拉取的启用用户，
+          # 并含 StatsService/HandlerService（供免重启增删用户 + 流量统计）。
+          # GATEWAY_URL 不可达时退化为仅含派生 uuid 的基础配置，xray 仍可启动。
+          python3 discover.py --write-xray-config xray.json
+          echo "--- xray.json ---"
+          cat xray.json
+
+      - name: Run proxy + overlap relay
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+            echo "::error::secret CF_TUNNEL_TOKEN 未设置"; exit 1
+          fi
+
+          # 固定时间参数（按需求写死，不用变量）
+          RELAY_AT=20700        # 5h45m 触发继任者
+          OVERLAP=600           # 接力后再重叠 10min，让继任者完全接管
+          HOURLY=3600           # 每小时跑一次 注册+用户同步(免重启)+流量上报
+
+          cleanup() {
+            echo ">>> cleanup: 停止 xray 监督循环与 cloudflared"
+            kill "$XRAY_SUP_PID" 2>/dev/null || true
+            pkill -x xray 2>/dev/null || true
+            kill "$CF_PID" 2>/dev/null || true
+          }
+
+          # 1) Xray 监督循环：仅用于 crash 自愈（用户同步走 API，免重启，不再 kill 它）
+          (
+            while true; do
+              ./xray run -c xray.json || true
+              echo ">>> xray exited, restarting in 2s ..."
+              sleep 2
+            done
+          ) &
+          XRAY_SUP_PID=$!
+
+          # 2) cloudflared 连命名隧道（公网 hostname -> http://localhost:8080，CF 后台配置）。
+          #    同一 token 可多 connector 并存 = HA，接力重叠期新旧两段同时在线、无缝交接。
+          ./cloudflared tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" &
+          CF_PID=$!
+          echo "started: xray(supervised, pid=$XRAY_SUP_PID) cloudflared=$CF_PID"
+
+          # 3) 每小时任务：discover.py 默认模式 = 注册节点 + 用户同步(adu/rmu 免重启) + 流量上报
+          (
+            sleep 25   # 等 xray api / cloudflared 就绪
+            if [ -n "${GATEWAY_URL:-}" ]; then
+              while true; do
+                python3 discover.py || echo ">>> hourly task failed (will retry next round)"
+                sleep "$HOURLY"
+              done
+            else
+              echo ">>> GATEWAY_URL 未设置：跳过注册/同步/流量（代理本身仍可用）"
+            fi
+          ) &
+
+          # 4) 重叠接力 + 优雅退出：固定时刻触发继任者 → 重叠 10min → 上报流量 → 清理停服退出。
+          (
+            sleep "$RELAY_AT"
+            if [ -n "${GH_PAT:-}" ]; then
+              echo ">>> triggering successor run for overlap relay ..."
+              curl -fsS -X POST \
+                -H "Authorization: Bearer ${GH_PAT}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+                -d "{\"ref\":\"${GITHUB_REF_NAME}\"}" \
+                && echo ">>> successor triggered" \
+                || echo ">>> successor trigger FAILED (检查 GH_PAT 权限)"
+
+              echo ">>> overlap ${OVERLAP}s，等继任者完全接管 ..."
+              sleep "$OVERLAP"
+              echo ">>> 交接前 flush 上报最后一段流量"
+              [ -n "${GATEWAY_URL:-}" ] && { python3 discover.py --report-traffic || true; }
+              cleanup
+            else
+              echo ">>> GH_PAT 未设置：本次只跑单段 6h，不接力（适合先单独测试）"
+            fi
+          ) &
+
+          # 5) 等 cloudflared 结束（被上面 cleanup kill / 自身退出 / 6h 超时），随后清理退出
+          wait "$CF_PID" 2>/dev/null || true
+          echo "leg ending."
+          cleanup
+          exit 0

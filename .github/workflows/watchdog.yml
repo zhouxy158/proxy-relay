@@ -1,0 +1,58 @@
+name: proxy-watchdog
+
+# 看门狗：每 15 分钟检查 proxy-relay 链路是否还活着；整条链断了才拉起一条新的。
+# 正常运行 / 接力重叠期都会判定为存活，不会重复拉起。
+#
+# 为什么需要它：proxy-relay 靠「自触发」接力续命，但若某次接力触发失败、或 cloudflared
+# 在接力前意外挂掉导致本段提前退出，链路就断了且无人拉起。看门狗兜这个底。
+#
+# 仅用于一次性学习实验，同样受 GitHub ToS 约束（见 README）。
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # 每 15 分钟（GitHub 定时最短 5min，高峰可能延迟）
+  workflow_dispatch:
+
+# 防重复：看门狗自身串行，避免相邻两次 tick 同时「判断 + 拉起」造成重复链路
+concurrency:
+  group: proxy-watchdog
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_PAT: ${{ secrets.GH_PAT }}
+      RELAY_WORKFLOW: proxy-relay.yml
+    steps:
+      - name: 链路存活检查，断了则拉起新链
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::secret GH_PAT 未设置（看门狗需要它查询 runs / 触发 proxy-relay）"
+            exit 1
+          fi
+          AUTH="Authorization: Bearer ${GH_PAT}"
+          ACC="Accept: application/vnd.github+json"
+          BASE="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${RELAY_WORKFLOW}"
+
+          # 取最近一次 proxy-relay run 的状态与创建时间
+          RESP="$(curl -fsS -H "$AUTH" -H "$ACC" "${BASE}/runs?per_page=1")"
+          STATUS="$(printf '%s' "$RESP"  | jq -r '.workflow_runs[0].status // "none"')"
+          CREATED="$(printf '%s' "$RESP" | jq -r '.workflow_runs[0].created_at // "1970-01-01T00:00:00Z"')"
+          THRESH="$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+          echo "latest proxy-relay run: status=${STATUS} created=${CREATED} (alive-threshold=${THRESH})"
+
+          # 存活判定：仍在排队/运行，或最近 20min 内刚创建
+          # （后者覆盖「接力刚 dispatch、还没翻成 in_progress」的排队延迟窗口，避免误判为断链而重复拉起）
+          if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ] || [[ "$CREATED" > "$THRESH" ]]; then
+            echo ">>> 链路存活，无需操作"
+            exit 0
+          fi
+
+          echo ">>> 链路已断，dispatch 一条新 proxy-relay"
+          # 必须用 GH_PAT（GITHUB_TOKEN 触发的 workflow_dispatch 不会产生新 run）
+          curl -fsS -X POST -H "$AUTH" -H "$ACC" -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${BASE}/dispatches" -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
+          echo ">>> dispatched"
