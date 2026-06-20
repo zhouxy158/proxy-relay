@@ -86,10 +86,13 @@ jobs:
             kill "$CF_PID" 2>/dev/null || true
           }
 
+          # 进程自身输出全部重定向到本地文件，【不】进 Actions 日志
+          # （xray/cloudflared 会打印 tunnelID、连接信息等，没必要也不该出现在公开日志里；
+          #   需要排错时可在 job 内 `tail` 这两个文件，或临时上传为 artifact）
           # 1) Xray 监督循环：仅用于 crash 自愈（用户同步走 API，免重启，不再 kill 它）
           (
             while true; do
-              ./xray run -c xray.json || true
+              ./xray run -c xray.json >>xray.log 2>&1 || true
               echo ">>> xray exited, restarting in 2s ..."
               sleep 2
             done
@@ -98,9 +101,9 @@ jobs:
 
           # 2) cloudflared 连命名隧道（公网 hostname -> http://localhost:8080，CF 后台配置）。
           #    同一 token 可多 connector 并存 = HA，接力重叠期新旧两段同时在线、无缝交接。
-          ./cloudflared tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" &
+          ./cloudflared tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" >cloudflared.log 2>&1 &
           CF_PID=$!
-          echo "started: xray(supervised, pid=$XRAY_SUP_PID) cloudflared=$CF_PID"
+          echo "started: xray(supervised, pid=$XRAY_SUP_PID) cloudflared=$CF_PID (输出已写入本地 *.log，不进 Actions 日志)"
 
           # 3) 每小时任务：discover.py 默认模式 = 注册节点 + 用户同步(adu/rmu 免重启) + 流量上报
           (
