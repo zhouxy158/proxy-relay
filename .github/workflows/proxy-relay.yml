@@ -53,18 +53,18 @@ jobs:
           chmod +x cloudflared
           ./cloudflared --version || true
 
-      - name: Write Xray config (VLESS-WS, 含已启用用户)
+      - name: Write Xray config (VLESS-WS, 基础配置/无用户)
         run: |
           set -euo pipefail
           if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
             echo "::error::secret CF_TUNNEL_TOKEN 未设置"; exit 1
           fi
-          # 由 discover.py 生成完整 xray.json：派生 uuid（节点自身）+ 网关拉取的启用用户，
-          # 并含 StatsService/HandlerService（供免重启增删用户 + 流量统计）。
-          # GATEWAY_URL 不可达时退化为仅含派生 uuid 的基础配置，xray 仍可启动。
+          # 由 discover.py 生成基础 xray.json：仅节点自身派生 uuid + StatsService/HandlerService。
+          # 用户【不】落盘——运行后由每小时任务经 xray API(adu) 动态加入，避免真实 uuid 进公开日志。
           python3 discover.py --write-xray-config xray.json
-          echo "--- xray.json ---"
-          cat xray.json
+          # 打印配置时把 clients[].id 脱敏（连节点自身 uuid 也不露）
+          echo "--- xray.json (clients[].id 已脱敏) ---"
+          jq '(.inbounds[]?.settings.clients[]?.id) |= "***"' xray.json
 
       - name: Run proxy + overlap relay
         run: |
