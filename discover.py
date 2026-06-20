@@ -196,11 +196,14 @@ def _normalize_user_proxy(p):
     return entry
 
 
-def fetch_users(url):
+def fetch_users(url, node_id=None):
     """拉启用用户 [{userId,uuid[,proxy]}]（仿 cron.py.fetch_users）。失败返回 None（绝不据此清空）。
 
-    proxy（可选）为该用户专属 socks5 出站，归一化后形如 {'type':'socks5','addr':..[,username,password]}。
+    node_id 随 ?nodeId= 传给网关，网关据此按本节点解析该用户在本节点的生效代理（每节点覆盖
+    → 回退用户全局代理）。proxy（可选）归一化后形如 {'type':'socks5','addr':..[,username,password]}。
     """
+    if node_id:
+        url = '%s?nodeId=%s' % (url, node_id)
     try:
         req = Request(url, headers={'User-Agent': 'proxy-relay-discover/%s' % __version__})
         obj = json.loads(urlopen(req, timeout=15).read().decode('utf-8'))
@@ -618,7 +621,7 @@ def main():
     else:
         print('WARN: CF_HOSTNAME 未设置，跳过注册', file=sys.stderr)
 
-    users = fetch_users(users_url())
+    users = fetch_users(users_url(), node_id)   # 传 nodeId → 网关按本节点解析每用户生效代理
     if users is not None:
         sync_xray_users_via_api(uuid, users)
         sync_xray_outbounds(users)

@@ -71,7 +71,7 @@ xray + cloudflared 起来约 25 秒后，**每小时**跑一次 `python3 discove
 - 生成 VLESS-WS 的 qrcode + Clash 配置（`server`/`SNI`/`Host` 都用 `CF_HOSTNAME`），POST 到 `${GATEWAY_URL}/discover?order=200&ai=<自动>`（`ai` 按归属地：CN/HK/MO=false）
 
 **② 用户同步（免重启）**
-- 从 `${GATEWAY_URL}/users` 拉启用用户 `{userId,uuid,enabled[,proxy]}`，只取 enabled
+- 从 `${GATEWAY_URL}/users?nodeId=<节点id>` 拉启用用户 `{userId,uuid,enabled[,proxy]}`，只取 enabled；传 `nodeId`（=注册/流量用的节点 id）让网关**按本节点**解析每用户生效代理（每节点覆盖 → 回退用户全局代理）
 - 用 xray **HandlerService API**（`xray api adu`/`rmu`）对运行中的 xray **动态增删用户，不重启**，对比 `inbounduser` 实时状态做增量
 - 用户**不落盘**（xray.json 的 clients 为空），只活在运行中的 xray 内存里；crash 重启后下轮同步自动补回；拉取失败则不动现有用户
 
