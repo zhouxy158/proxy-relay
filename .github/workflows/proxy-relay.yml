@@ -77,7 +77,7 @@ jobs:
           RELAY_AT=20700        # 5h45m 触发继任者
           OVERLAP=600           # 接力后再重叠 10min，让继任者完全接管
           HOURLY=3600           # 每小时跑一次 注册+用户同步(免重启)+流量上报
-          CLEANUP_OLD_AT=720    # 启动 12min 后删除已完成的旧 run（上一棒此时已退出）
+          CLEANUP_OLD_AT=60    # 启动 12min 后删除已完成的旧 run（上一棒此时已退出）
 
           cleanup() {
             echo ">>> cleanup: 停止 xray 监督循环与 cloudflared"
