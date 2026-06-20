@@ -119,6 +119,17 @@ def _mask_uuid(u):
     return (u[:8] + '…') if u and len(u) > 8 else '***'
 
 
+def _mask_ip(ip):
+    """日志脱敏：IPv4 只露首段，IPv6 只露首组，避免 runner 公网 IP 进公开日志"""
+    if not ip:
+        return ''
+    if '.' in ip:
+        return ip.split('.', 1)[0] + '.*.*.*'
+    if ':' in ip:
+        return ip.split(':', 1)[0] + ':***'
+    return '***'
+
+
 def country_code_to_flag(code):
     try:
         return u''.join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
@@ -395,7 +406,7 @@ def register_node(uuid, node_id, host, ip_info):
     url = '%s?order=%d&ai=%s' % (discover_url(), order, 'true' if ai else 'false')
     qrcode = build_qrcode(uuid, host, WS_PATH, label)            # remarks 用裸标签（同 cron.py）
     clash = build_clash(uuid, host, WS_PATH, name_flagged)
-    print(u'注册节点: %s (ip=%s host=%s order=%d ai=%s)' % (name_flagged, ip_info.get('ip', ''), host, order, ai))
+    print(u'注册节点: %s (ip=%s host=%s order=%d ai=%s)' % (name_flagged, _mask_ip(ip_info.get('ip', '')), host, order, ai))
     try:
         ok, resp = post_discover(url, name_flagged, qrcode, clash, node_id, ip_info.get('ip', ''), ip_info)
         print('网关响应: %s' % resp)
