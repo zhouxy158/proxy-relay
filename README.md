@@ -63,23 +63,28 @@
 仓库 → **Actions** → 选 `proxy-relay` → **Run workflow**。它会自我接力下去。
 （首次可先不配 `GH_PAT`，跑一段 6h 验证代理本身通不通，再加 `GH_PAT` 开启接力。）
 
-### 5. 每小时任务：注册 + 用户同步 + 流量上报（discover.py 默认模式）
-xray + cloudflared 起来约 25 秒后，**每小时**跑一次 `python3 discover.py`（仿 `cron.py`），一次做三件事：
+### 5. 每小时任务：注册 + 用户同步 + 每用户出站 + 流量上报（discover.py 默认模式）
+xray + cloudflared 起来约 25 秒后，**每小时**跑一次 `python3 discover.py`（仿 `cron.py`），一次做四件事：
 
 **① 注册节点**
 - 自动用 `ip-api.com` 查 runner 公网 IP → `countryCode` 转**国旗 emoji**；节点名 = `国旗 + PROXY_NAME`，如 **`🇺🇸 Github Actions`**
 - 生成 VLESS-WS 的 qrcode + Clash 配置（`server`/`SNI`/`Host` 都用 `CF_HOSTNAME`），POST 到 `${GATEWAY_URL}/discover?order=200&ai=<自动>`（`ai` 按归属地：CN/HK/MO=false）
 
 **② 用户同步（免重启）**
-- 从 `${GATEWAY_URL}/users` 拉启用用户 `{userId,uuid,enabled}`，只取 enabled
+- 从 `${GATEWAY_URL}/users` 拉启用用户 `{userId,uuid,enabled[,proxy]}`，只取 enabled
 - 用 xray **HandlerService API**（`xray api adu`/`rmu`）对运行中的 xray **动态增删用户，不重启**，对比 `inbounduser` 实时状态做增量
-- 同时把当前用户回写 `xray.json`，保证 crash 重启后冷启动一致；拉取失败则保留现有用户不清空
+- 用户**不落盘**（xray.json 的 clients 为空），只活在运行中的 xray 内存里；crash 重启后下轮同步自动补回；拉取失败则不动现有用户
 
-**③ 流量上报**
+**③ 每用户专属 socks5 出站（免重启）**
+- 用户带 `proxy`（`{type:socks5,addr[,username,password]}`）时，用 xray **RoutingService API**（`ado`/`rmo` + `adrules`/`rmrules`）给该用户下发专属 socks5 出站 + 路由规则（`tag=puo-<userId>`，按 user email 路由），**不重启**
+- 无「列出出站」的 API，故用本地状态文件（`PUO_STATE`，默认 `puo_state.json`，**仅记 userId、不存凭证、不进日志**）算移除集；desired 每轮全量 upsert（覆盖地址/密码变更）
+- 代理凭证同样**不落盘**，只在 xray 内存里
+
+**④ 流量上报**
 - xray 配置含 `StatsService`，用 `xray api statsquery -reset 'user>>>'` 读每用户上下行（读即清零=增量）
 - POST 到 `${GATEWAY_URL}/traffic`（`{nodeId, ip, deltas:[{userId,up,down}]}`），无增量则跳过
 
-> 未设置 `GATEWAY_URL` 时三件事全跳过，代理本身照常可用。在面板里启用一个用户后，约 1 小时内（或下次任务）该节点即接受其 uuid 连接。
+> 未设置 `GATEWAY_URL` 时全部跳过，代理本身照常可用。`RoutingService` 是新加的——正在跑的旧棒没有它，出站同步会优雅失败（打 warning），**6h 后接力换新棒即生效**。
 
 ---
 
