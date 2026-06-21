@@ -49,7 +49,7 @@ import subprocess
 from collections import OrderedDict
 from urllib.request import Request, urlopen
 
-__version__ = 'gha-relay-1.1.0'   # 每次改 demo（discover.py / proxy-relay.yml）都往上加
+__version__ = 'gha-relay-1.1.1'   # 每次改 demo（discover.py / proxy-relay.yml）都往上加
 
 # WebSocket 路径（固定）。必须与 xray.json 里 wsSettings.path 保持一致。
 WS_PATH = '/api/v3/runner/heartbeat'
@@ -575,6 +575,9 @@ def post_discover(url, proxy_name, qrcode, clash, node_uuid, ip, ip_info):
     }
     req = Request(url, data=urlencode(body).encode('utf-8'))
     req.add_header('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8')
+    # 必须带自定义 UA：经 Cloudflare 前置后默认 Python-urllib UA 会被 bot 管理拦成 403；
+    # 其余请求(fetch_users/fetch_proxy_rev/post_traffic)已带，唯独此处曾漏
+    req.add_header('User-Agent', 'proxy-relay-discover/%s' % __version__)
     resp = urlopen(req, timeout=30).read().decode('utf-8')
     return json.loads(resp).get('code') in (0, 88), resp
 
