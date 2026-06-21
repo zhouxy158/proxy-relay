@@ -49,7 +49,7 @@ import subprocess
 from collections import OrderedDict
 from urllib.request import Request, urlopen
 
-__version__ = 'gha-relay-1.0.0'
+__version__ = 'gha-relay-1.1.0'   # 每次改 demo（discover.py / proxy-relay.yml）都往上加
 
 # WebSocket 路径（固定）。必须与 xray.json 里 wsSettings.path 保持一致。
 WS_PATH = '/api/v3/runner/heartbeat'
