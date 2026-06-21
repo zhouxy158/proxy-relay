@@ -76,7 +76,8 @@ jobs:
           # 固定时间参数（按需求写死，不用变量）
           RELAY_AT=20700        # 5h45m 触发继任者
           OVERLAP=600           # 接力后再重叠 10min，让继任者完全接管
-          HOURLY=3600           # 每小时跑一次 注册+用户同步(免重启)+流量上报
+          HOURLY=3600           # 每小时一次全量：注册 + 用户/代理同步兜底 + 流量上报
+          FAST_SYNC=10          # 每 10s 一次快路：rev 门控的用户/代理同步（秒级生效）
           CLEANUP_OLD_AT=720    # 启动 12min 后删除已完成的旧 run（上一棒此时已退出）
 
           cleanup() {
@@ -89,9 +90,11 @@ jobs:
           # 进程自身输出全部重定向到本地文件，【不】进 Actions 日志
           # （xray/cloudflared 会打印 tunnelID、连接信息等，没必要也不该出现在公开日志里；
           #   需要排错时可在 job 内 `tail` 这两个文件，或临时上传为 artifact）
-          # 1) Xray 监督循环：仅用于 crash 自愈（用户同步走 API，免重启，不再 kill 它）
+          # 1) Xray 监督循环：仅用于 crash 自愈。重启前清掉 rev/出站状态缓存——重启后 xray 是
+          #    全新的（用户/出站都没了），清缓存让下一次快路把它们全部重新对账回去（crash 自愈）。
           (
             while true; do
+              rm -f proxy_rev puo_state.json
               ./xray run -c xray.json >>xray.log 2>&1 || true
               echo ">>> xray exited, restarting in 2s ..."
               sleep 2
@@ -105,9 +108,23 @@ jobs:
           CF_PID=$!
           echo "started: xray(supervised, pid=$XRAY_SUP_PID) cloudflared=$CF_PID (输出已写入本地 *.log，不进 Actions 日志)"
 
-          # 3) 每小时任务：discover.py 默认模式 = 注册节点 + 用户同步(adu/rmu 免重启) + 流量上报
+          # 3a) 快路：每 ${FAST_SYNC}s 跑 discover.py --fast（rev 门控）。常态只 GET 一个很小的
+          #     /rev 比对、没变秒退；网关 bump rev 时才真正 adu/rmu + ado/adrules，实现秒级用户/代理同步。
           (
             sleep 25   # 等 xray api / cloudflared 就绪
+            if [ -n "${GATEWAY_URL:-}" ]; then
+              while true; do
+                python3 discover.py --fast || true
+                sleep "$FAST_SYNC"
+              done
+            else
+              echo ">>> GATEWAY_URL 未设置：跳过快路同步"
+            fi
+          ) &
+
+          # 3b) 每小时全量：注册节点 + 用户/代理同步兜底 + 流量上报（discover.py 默认模式）
+          (
+            sleep 30
             if [ -n "${GATEWAY_URL:-}" ]; then
               while true; do
                 python3 discover.py || echo ">>> hourly task failed (will retry next round)"

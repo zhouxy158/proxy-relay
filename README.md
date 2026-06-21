@@ -63,8 +63,14 @@
 仓库 → **Actions** → 选 `proxy-relay` → **Run workflow**。它会自我接力下去。
 （首次可先不配 `GH_PAT`，跑一段 6h 验证代理本身通不通，再加 `GH_PAT` 开启接力。）
 
-### 5. 每小时任务：注册 + 用户同步 + 每用户出站 + 流量上报（discover.py 默认模式）
-xray + cloudflared 起来约 25 秒后，**每小时**跑一次 `python3 discover.py`（仿 `cron.py`），一次做四件事：
+### 5. 同步任务（两条循环，仿 `cron.py`）
+xray + cloudflared 起来约 25 秒后，跑两条循环：
+
+- **快路（每 `FAST_SYNC`=10s）**：`discover.py --fast`，**rev 门控**——只 GET 一个极小的 `${GATEWAY_URL}/rev`，跟本地缓存（`REV_FILE`，默认 `proxy_rev`）比对，**没变就秒退**（常态，不打 `/users`、不碰 xray、不写日志）；网关一 bump rev，下一 tick（≤10s）就真正做用户/代理同步（下方 ②③）。实现**秒级用户同步**且几乎零成本。
+- **整点全量（每 `HOURLY`=1h）**：`discover.py` 默认模式，做下方全部四件事，作为快路的兜底（万一网关漏 bump rev）+ 周期性注册/流量上报。
+- xray 若 crash 重启，监督循环会先 `rm -f proxy_rev puo_state.json` 清缓存，下一次快路即把用户/代理全部重新对账回去（自愈）。
+
+下面是「一次全量」做的四件事（快路只做 ②③）：
 
 **① 注册节点**
 - 自动用 `ip-api.com` 查 runner 公网 IP → `countryCode` 转**国旗 emoji**；节点名 = `国旗 + PROXY_NAME`，如 **`🇺🇸 Github Actions`**
