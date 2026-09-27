@@ -8,11 +8,13 @@ discover.py —— 精简版节点注册/用户同步/流量上报脚本（仿�
   - 同步启用用户到 xray（用 HandlerService 的 adu/rmu 动态增删，**免重启**）
   - 同步每用户专属 socks5 出站（用 RoutingService 的 ado/rmo + adrules/rmrules，**免重启**）
   - 上报每用户流量增量（StatsService statsquery，读即清零）
+  - 上报本机 CPU/内存/负载/磁盘快照（快路每分钟捎带在 /rev 轮询里，同 cron.py）
 
 网关只用一个基址变量 GATEWAY_URL（含你自己的路径前缀），代码按通用后缀拼出不同功能：
   - {GATEWAY_URL}/discover  注册
   - {GATEWAY_URL}/users     拉启用用户
   - {GATEWAY_URL}/traffic   上报流量
+  - {GATEWAY_URL}/rev       快路门控；每分钟那一次改 POST，捎带负载快照
 
 环境变量：
     GATEWAY_URL      必填  网关基址（含私有路径前缀，整段放 GitHub Secrets，避免公开仓库泄露）
@@ -26,6 +28,7 @@ discover.py —— 精简版节点注册/用户同步/流量上报脚本（仿�
     XRAY_PORT        可选  xray 本地监听端口，默认 8080
     PUO_STATE        可选  每用户出站状态文件路径，默认 puo_state.json（仅记 userId，不存凭证）
     REV_FILE         可选  快路 rev 缓存文件，默认 proxy_rev
+    STATUS_STATE     可选  负载上报状态文件（上次上报时间 + CPU 采样），默认 status_state
 
 uuid 不落盘：xray.json 的 clients 为空（连节点自身 uuid 也不放，它只作节点身份/注册模板）。
 用户与每用户 socks5 出站均由每小时任务经 xray API 动态增删，只活在运行中的 xray 内存里，
@@ -44,12 +47,13 @@ import sys
 import json
 import uuid as uuidlib
 import base64
+import time
 import tempfile
 import subprocess
 from collections import OrderedDict
 from urllib.request import Request, urlopen
 
-__version__ = 'gha-relay-1.1.1'   # 每次改 demo（discover.py / proxy-relay.yml）都往上加
+__version__ = 'gha-relay-1.2.0'   # 每次改 demo（discover.py / proxy-relay.yml）都往上加
 
 # WebSocket 路径（固定）。必须与 xray.json 里 wsSettings.path 保持一致。
 WS_PATH = '/api/v3/runner/heartbeat'
@@ -64,6 +68,8 @@ DISCOVER_PATH = '/discover'
 USERS_PATH = '/users'
 TRAFFIC_PATH = '/traffic'
 REV_PATH = '/rev'                  # 快路门控：拉一个很小的 revision 号，没变就秒退
+# 节点负载快照捎带在 /rev 轮询里上报（那一次改 POST 带表单），不另开请求，间隔同 cron.py
+STATUS_REPORT_INTERVAL = 60
 # 派生 uuid 用的固定命名空间（项目私有，随意但固定即可）
 UUID_NAMESPACE = uuidlib.UUID('9f3a7c1e-5b2d-4e88-a1c6-3d0f2b6e7a90')
 
@@ -90,10 +96,15 @@ def rev_url():
     return gateway_base() + REV_PATH
 
 
-def fetch_proxy_rev():
-    """GET {GATEWAY_URL}/rev → 当前 revision 字符串；失败返回 None（快路据此跳过本次）。"""
+def fetch_proxy_rev(status_data=None):
+    """GET {GATEWAY_URL}/rev → 当前 revision 字符串；失败返回 None（快路据此跳过本次）。
+
+    status_data 非空时改 POST 表单，顺带上报本机负载快照（见 build_status_post_data）。
+    """
+    from urllib.parse import urlencode
     try:
-        req = Request(rev_url(), headers={'User-Agent': 'proxy-relay-discover/%s' % __version__})
+        data = urlencode(status_data).encode('utf-8') if status_data else None
+        req = Request(rev_url(), data=data, headers={'User-Agent': 'proxy-relay-discover/%s' % __version__})
         data = urlopen(req, timeout=10).read().decode('utf-8')
         obj = json.loads(data) if data.strip() else {}
         rev = obj.get('rev')
@@ -538,6 +549,97 @@ def post_traffic(node_id, ip, traffic_map):
         return False
 
 
+# ------------------------------------------------ 负载快照（捎带在 /rev 里，同 cron.py）
+# 只跑在 GitHub ubuntu runner 上：/proc 各项、MemAvailable、getloadavg 都是确定有的，
+# 缺了就抛（快路打 WARN），不照搬 cron.py 给老内核/老 Python 的兜底。
+
+def _read_cpu_sample():
+    """/proc/stat 首行 → (idle, total) jiffies，idle 含 iowait。"""
+    with open('/proc/stat') as f:
+        line = f.readline()
+    fields = line.split()
+    if len(fields) < 9 or fields[0] != 'cpu':
+        raise ValueError('/proc/stat 首行不是 cpu 汇总行: %r' % line)
+    # user nice system idle iowait irq softirq steal；guest 已计入 user，不重复加
+    values = [int(v) for v in fields[1:9]]
+    return values[3] + values[4], sum(values)
+
+
+def _read_meminfo():
+    """/proc/meminfo → {key: bytes}，只收带 kB 单位的行（HugePages_* 是页数，用不到）。"""
+    info = {}
+    with open('/proc/meminfo') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == 'kB':
+                info[parts[0].rstrip(':')] = int(parts[1]) * 1024
+    return info
+
+
+def collect_system_status(prev_cpu, cur_cpu):
+    """负载快照，字段同 cron.py（服务端 NodeStatus）。CPU 为 prev_cpu→cur_cpu 之间的平均占用。"""
+    d_total = cur_cpu[1] - prev_cpu[1]
+    d_idle = cur_cpu[0] - prev_cpu[0]
+    load1, load5, load15 = os.getloadavg()
+    mem = _read_meminfo()
+    st = os.statvfs('/')
+    with open('/proc/uptime') as f:
+        uptime = int(float(f.read().split()[0]))
+    return OrderedDict([
+        ('cpu', round(max(0.0, min(100.0, 100.0 * (d_total - d_idle) / d_total)), 1)),
+        ('cores', os.cpu_count()),
+        ('load1', round(load1, 2)), ('load5', round(load5, 2)), ('load15', round(load15, 2)),
+        ('memTotal', mem['MemTotal']), ('memAvailable', mem['MemAvailable']),
+        ('swapTotal', mem['SwapTotal']), ('swapFree', mem['SwapFree']),
+        ('diskTotal', st.f_blocks * st.f_frsize), ('diskFree', st.f_bavail * st.f_frsize),
+        ('uptime', uptime),
+    ])
+
+
+def _load_status_state(path):
+    """→ (上次上报时间, idle, total)；文件不存在（本棒首轮）返回 None。内容是本脚本原子写的，解析不了就抛。"""
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None
+    fields = raw.split()
+    if len(fields) != 3:
+        raise ValueError('%s 不是 "时间 idle total": %r' % (path, raw))
+    return float(fields[0]), int(fields[1]), int(fields[2])
+
+
+def _save_status_state(path, t, cpu_sample):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('%.3f %d %d\n' % (t, cpu_sample[0], cpu_sample[1]))
+    os.replace(tmp, path)
+
+
+def build_status_post_data(node_id):
+    """到点（距上次 ≥ STATUS_REPORT_INTERVAL）就采负载快照，组装成 /rev 的捎带表单；不到点返回 None。
+
+    快路每轮都是新起的 python 进程，上次上报时间和 CPU 采样落在 STATUS_STATE 里：CPU 取上次
+    采样到这次之差，即这一分钟的平均占用（同 cron.py 常驻循环）。本棒首轮只落基线、不报。
+    时间和基线先落盘再采其余项：采集失败 / rev 没发出去都只丢这一分钟，下一分钟照常。
+    一个 runner 只跑这一个节点，nodeIds 就是本节点 id。
+    """
+    path = os.environ.get('STATUS_STATE', 'status_state')
+    now = time.time()
+    prev = _load_status_state(path)
+    if prev is not None and now - prev[0] < STATUS_REPORT_INTERVAL:
+        return None
+    cur = _read_cpu_sample()
+    _save_status_state(path, now, cur)
+    if prev is None:
+        return None
+    return {
+        'nodeIds': node_id,
+        'version': __version__,
+        'status': json.dumps(collect_system_status(prev[1:], cur), separators=(',', ':')),
+    }
+
+
 # ---------------------------------------------------------------- 注册
 
 def build_qrcode(uuid, host, path, name):
@@ -638,12 +740,18 @@ def main():
 
     # --fast：rev 门控的快速用户/代理同步（不查 ip、不注册、不报流量）。
     # 只 GET 一个很小的 /rev，没变就秒退（常态）；变了才拉用户做 adu/rmu + ado/adrules。
-    # 适合每 ~10s 跑一次，实现秒级用户同步。
+    # 适合每 ~10s 跑一次，实现秒级用户同步。每分钟那一轮改 POST，捎带本机负载快照。
     if '--fast' in argv:
         if not gateway_base():
             return 0
         rev_file = os.environ.get('REV_FILE', 'proxy_rev')
-        cur = fetch_proxy_rev()
+        status_data = None
+        try:
+            status_data = build_status_post_data(node_id)
+        except Exception as e:
+            # 负载是捎带的，采集失败绝不能耽误 rev 同步
+            print('WARN: 负载快照采集失败: %s: %s' % (type(e).__name__, e), file=sys.stderr)
+        cur = fetch_proxy_rev(status_data)
         if cur is None:
             return 0                       # 网关不可达/无 rev：静默跳过，整点全量兜底
         if cur == _load_rev(rev_file):
